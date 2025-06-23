@@ -8,6 +8,7 @@ use crate::{
     Align, Document, DocumentId, Theme, ViewId,
 };
 
+use futures_util::TryFutureExt;
 use helix_core::{
     char_idx_at_visual_offset,
     doc_formatter::TextFormat,
@@ -190,7 +191,35 @@ impl View {
     }
 
     pub fn inner_area(&self, doc: &Document) -> Rect {
-        self.area.clip_left(self.gutter_offset(doc)).clip_bottom(1) // -1 for statusline
+        // zen mode with wrap and text_width
+        // https://github.com/helix-editor/helix/discussions/6468#discussion-5013061
+        let config = doc.config.load();
+        let self_width = self.inner_width(doc);
+        let text_width = doc
+            .language_config()
+            .and_then(|config| config.text_width)
+            .unwrap_or(config.text_width) as u16;
+        let soft_wrap_at_text_width = doc
+            .language_config()
+            .and_then(|config| {
+                config
+                    .soft_wrap
+                    .as_ref()
+                    .and_then(|soft_wrap| soft_wrap.wrap_at_text_width)
+            })
+            .or(config.soft_wrap.wrap_at_text_width)
+            .unwrap_or(false);
+
+        let space_width = if soft_wrap_at_text_width && self_width.gt(&text_width) {
+            (self_width - text_width) / 2
+        } else {
+            0
+        };
+
+        self.area
+            .clip_left(self.gutter_offset(doc) + space_width)
+            .clip_right(space_width)
+            .clip_bottom(1) // -1 for statusline
     }
 
     pub fn inner_height(&self) -> usize {
