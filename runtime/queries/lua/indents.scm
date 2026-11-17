@@ -15,6 +15,12 @@
 [
   "end"
   "until"
+  "else"
+  "elseif"
   "}"
   ")"
 ] @outdent
+
+; Handle partially typed code.
+(ERROR "then" @indent @extend)
+(ERROR "do" @indent @extend)

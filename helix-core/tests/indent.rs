@@ -1,21 +1,13 @@
 use helix_core::{
-    indent::{indent_level_for_line, treesitter_indent_for_pos, IndentStyle},
+    indent::{
+        indent_level_for_line, treesitter_format_changes, treesitter_indent_for_pos, IndentStyle,
+    },
     syntax::{config::Configuration, Loader},
-    Syntax,
+    Syntax, Transaction,
 };
 use helix_stdx::rope::RopeSliceExt;
 use ropey::Rope;
 use std::{ops::Range, path::PathBuf, process::Command};
-
-#[test]
-fn test_treesitter_indent_rust() {
-    standard_treesitter_test("rust.rs", "source.rust");
-}
-
-#[test]
-fn test_treesitter_indent_cpp() {
-    standard_treesitter_test("cpp.cpp", "source.cpp");
-}
 
 #[test]
 fn test_treesitter_indent_rust_helix() {
@@ -154,16 +146,67 @@ fn test_indent_level_for_line_with_spaces_and_tabs() {
     assert_eq!(indent_level, 2)
 }
 
+#[test]
+fn test_treesitter_format_reindents_messy_rust() {
+    let loader = Loader::new(indent_tests_config()).unwrap();
+    let mut runtime = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    runtime.push("../runtime");
+    std::env::set_var("HELIX_RUNTIME", runtime.to_str().unwrap());
+    let language = loader.language_for_scope("source.rust").unwrap();
+    let indent_style = IndentStyle::Spaces(4);
+    let tab_width = 4;
+
+    let messy = "fn foo() {\nlet x = 1;\n      if x > 0 {\n   x + 1\n} else {\n            x - 1\n   }\n}\n";
+
+    let expected = "fn foo() {\n    let x = 1;\n    if x > 0 {\n        x + 1\n    } else {\n        x - 1\n    }\n}\n";
+
+    let mut doc = Rope::from_str(messy);
+    let syntax = Syntax::new(doc.slice(..), language, &loader).unwrap();
+    let query = loader.indent_query(language).unwrap();
+    let changes = treesitter_format_changes(
+        query,
+        &syntax,
+        &loader,
+        &indent_style,
+        tab_width,
+        doc.slice(..),
+    );
+    Transaction::change(&doc, changes.into_iter()).apply(&mut doc);
+    assert_eq!(doc.to_string(), expected);
+
+    let syntax = Syntax::new(doc.slice(..), language, &loader).unwrap();
+    let again = treesitter_format_changes(
+        query,
+        &syntax,
+        &loader,
+        &indent_style,
+        tab_width,
+        doc.slice(..),
+    );
+    assert!(again.is_empty(), "second pass produced changes: {again:?}");
+}
+
+#[test]
+fn test_new_line_after_trailing_comment_with_crlf() {
+    let loader = Loader::new(indent_tests_config()).unwrap();
+    let mut runtime = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    runtime.push("../runtime");
+    std::env::set_var("HELIX_RUNTIME", runtime.to_str().unwrap());
+    let language = loader.language_for_scope("source.cpp").unwrap();
+    let query = loader.indent_query(language).unwrap();
+    let doc = Rope::from_str("if (x) // c\r\n    foo();\r\n");
+    let syntax = Syntax::new(doc.slice(..), language, &loader).unwrap();
+    let indent =
+        treesitter_indent_for_pos(query, &syntax, &loader, 4, 4, doc.slice(..), 0, 11, true)
+            .unwrap()
+            .to_string(&IndentStyle::Spaces(4), 4);
+    assert_eq!(indent, "    ");
+}
+
 fn indent_tests_dir() -> PathBuf {
     let mut test_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     test_dir.push("tests/data/indent");
     test_dir
-}
-
-fn indent_test_path(name: &str) -> PathBuf {
-    let mut path = indent_tests_dir();
-    path.push(name);
-    path
 }
 
 fn indent_tests_config() -> Configuration {
@@ -171,13 +214,6 @@ fn indent_tests_config() -> Configuration {
     config_path.push("languages.toml");
     let config = std::fs::read_to_string(config_path).unwrap();
     toml::from_str(&config).unwrap()
-}
-
-fn standard_treesitter_test(file_name: &str, lang_scope: &str) {
-    let test_path = indent_test_path(file_name);
-    let test_file = std::fs::File::open(test_path).unwrap();
-    let doc = ropey::Rope::from_reader(test_file).unwrap();
-    test_treesitter_indent(file_name, doc, lang_scope, Vec::new())
 }
 
 /// Test that all the lines in the given file are indented as expected.
@@ -212,6 +248,7 @@ fn test_treesitter_indent(
             let suggested_indent = treesitter_indent_for_pos(
                 indent_query,
                 &syntax,
+                &loader,
                 tab_width,
                 indent_style.indent_width(tab_width),
                 text,
@@ -222,7 +259,7 @@ fn test_treesitter_indent(
             .unwrap()
             .to_string(&indent_style, tab_width);
             assert!(
-                line.get_slice(..pos).map_or(false, |s| s == suggested_indent),
+                line.get_slice(..pos).is_some_and(|s| s == suggested_indent),
                 "Wrong indentation for file {:?} on line {}:\n\"{}\" (original line)\n\"{}\" (suggested indentation)\n",
                 test_name,
                 i+1,

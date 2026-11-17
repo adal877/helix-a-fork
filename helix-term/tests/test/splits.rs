@@ -169,7 +169,7 @@ async fn test_changes_in_splits_apply_to_all_views() -> anyhow::Result<()> {
 
     // See <https://github.com/helix-editor/helix/issues/4957>.
     // This sequence undoes part of the history and then adds new changes, creating a
-    // new branch in the history tree. `View::sync_changes` applies transactions down
+    // new branch in the history tree. Mapping a jump to the current revision applies transactions down
     // and up to the lowest common ancestor in the path between old and new revision
     // numbers. If we apply these up/down transactions in the wrong order, this case
     // panics.
@@ -191,6 +191,51 @@ async fn test_changes_in_splits_apply_to_all_views() -> anyhow::Result<()> {
         "#[|]#",
         LineFeedHandling::AsIs,
     ))
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_changes_in_splits_jumplist_sync() -> anyhow::Result<()> {
+    // See <https://github.com/helix-editor/helix/issues/9833>
+    // When jumping backwards (<C-o>) switches between two documents, we need to
+    // ensure that the current view has been synced with all changes to the
+    // document that occurred since the last time the view focused this document.
+    // If the view isn't synced then this case panics since we try to form a
+    // selection on "test" (which was deleted in the other view).
+    test((
+        "#[test|]#",
+        "<C-w>sgf<C-w>wd<C-w>w<C-o><C-w>qd",
+        "#[|]#",
+        LineFeedHandling::AsIs,
+    ))
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_reload_all_with_split_jumplist() -> anyhow::Result<()> {
+    // See reproduction from <https://github.com/helix-editor/helix/issues/9830>: jumps in the
+    // second split have to be mapped through the reload.
+    use std::io::Write;
+    let mut file = tempfile::NamedTempFile::new()?;
+    file.write_all(b"line1\nline2\nline3\n")?;
+    file.flush()?;
+
+    let mut app = helpers::AppBuilder::new()
+        .with_file(file.path(), None)
+        .build()?;
+
+    test_key_sequence(
+        &mut app,
+        Some("<C-w>s]<space>%2Gms/:rla<ret>%J<C-w>q"),
+        Some(&|app| {
+            helpers::assert_status_not_error(&app.editor);
+        }),
+        false,
+    )
     .await?;
 
     Ok(())

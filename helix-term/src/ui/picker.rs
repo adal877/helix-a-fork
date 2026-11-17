@@ -57,6 +57,9 @@ use self::handlers::{DynamicQueryChange, DynamicQueryHandler, PreviewHighlightHa
 pub const ID: &str = "picker";
 
 pub const MIN_AREA_WIDTH_FOR_PREVIEW: u16 = 72;
+pub const MIN_AREA_HEIGHT_FOR_STACKED_PREVIEW: u16 = 36;
+/// Terminal cells are about 1:2 aspect ratio
+const CELL_ASPECT: u16 = 2;
 /// Biggest file size to preview in bytes
 pub const MAX_FILE_SIZE_FOR_PREVIEW: u64 = 10 * 1024 * 1024;
 
@@ -258,6 +261,7 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     widths: Vec<Constraint>,
 
     callback_fn: PickerCallback<T>,
+    default_action: Action,
 
     pub truncate_start: bool,
     /// Caches paths to documents
@@ -280,7 +284,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         assert!(matcher_columns > 0);
         let matcher = Nucleo::new(
             Config::DEFAULT,
-            Arc::new(helix_event::request_redraw),
+            Arc::new(helix_event::redraw_requester()),
             None,
             matcher_columns,
         );
@@ -308,11 +312,14 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         F: Fn(&mut Context, &T, Action) + 'static,
     {
         let columns: Arc<[_]> = columns.into_iter().collect();
-        let matcher_columns = columns.iter().filter(|col| col.filter).count() as u32;
+        let matcher_columns = columns
+            .iter()
+            .filter(|col: &&Column<T, D>| col.filter)
+            .count() as u32;
         assert!(matcher_columns > 0);
         let matcher = Nucleo::new(
             Config::DEFAULT,
-            Arc::new(helix_event::request_redraw),
+            Arc::new(helix_event::redraw_requester()),
             None,
             matcher_columns,
         );
@@ -382,6 +389,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             truncate_start: true,
             show_preview: true,
             callback_fn: Box::new(callback_fn),
+            default_action: Action::Replace,
             completion_height: 0,
             widths,
             preview_cache: HashMap::new(),
@@ -424,6 +432,11 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         self
     }
 
+    pub fn with_initial_cursor(mut self, cursor: u32) -> Self {
+        self.cursor = cursor;
+        self
+    }
+
     pub fn with_dynamic_query(
         mut self,
         callback: DynQueryCallback<T, D>,
@@ -437,6 +450,11 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         };
         helix_event::send_blocking(&handler, event);
         self.dynamic_query_handler = Some(handler);
+        self
+    }
+
+    pub fn with_default_action(mut self, action: Action) -> Self {
+        self.default_action = action;
         self
     }
 
@@ -595,11 +613,15 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 let preview = std::fs::metadata(&path)
                     .and_then(|metadata| {
                         if metadata.is_dir() {
-                            let files = super::directory_content(&path)?;
+                            let files = super::directory_content(&path, editor)?;
                             let file_names: Vec<_> = files
                                 .iter()
-                                .filter_map(|(path, is_dir)| {
-                                    let name = path.file_name()?.to_string_lossy();
+                                .filter_map(|(file_path, is_dir)| {
+                                    let name = file_path
+                                        .strip_prefix(&path)
+                                        .map(|p| Some(p.as_os_str()))
+                                        .unwrap_or_else(|_| file_path.file_name())?
+                                        .to_string_lossy();
                                     if *is_dir {
                                         Some((format!("{}/", name), true))
                                     } else {
@@ -612,15 +634,14 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                             if metadata.len() > MAX_FILE_SIZE_FOR_PREVIEW {
                                 return Ok(CachedPreview::LargeFile);
                             }
-                            let content_type = std::fs::File::open(&path).and_then(|file| {
+                            let is_binary = std::fs::File::open(&path).and_then(|file| {
                                 // Read up to 1kb to detect the content type
                                 let n = file.take(1024).read_to_end(&mut self.read_buffer)?;
-                                let content_type =
-                                    content_inspector::inspect(&self.read_buffer[..n]);
+                                let is_binary = crate::is_binary(&self.read_buffer[..n]);
                                 self.read_buffer.clear();
-                                Ok(content_type)
+                                Ok(is_binary)
                             })?;
-                            if content_type.is_binary() {
+                            if is_binary {
                                 return Ok(CachedPreview::Binary);
                             }
                             let mut doc = Document::open(
@@ -881,7 +902,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         if let Some((preview, range)) = self.get_preview(cx.editor) {
             let doc = match preview.document() {
                 Some(doc)
-                    if range.map_or(true, |(start, end)| {
+                    if range.is_none_or(|(start, end)| {
                         start <= end && end <= doc.text().len_lines()
                     }) =>
                 {
@@ -940,10 +961,26 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             }
 
             let loader = cx.editor.syn_loader.load();
+            let config = cx.editor.config();
 
             let syntax_highlighter =
                 EditorView::doc_syntax_highlighter(doc, offset.anchor, area.height, &loader);
             let mut overlay_highlights = Vec::new();
+            if doc
+                .language_config()
+                .and_then(|config| config.rainbow_brackets)
+                .unwrap_or(config.rainbow_brackets)
+            {
+                if let Some(overlay) = EditorView::doc_rainbow_highlights(
+                    doc,
+                    offset.anchor,
+                    area.height,
+                    &cx.editor.theme,
+                    &loader,
+                ) {
+                    overlay_highlights.push(overlay);
+                }
+            }
 
             EditorView::doc_diagnostics_highlights_into(
                 doc,
@@ -989,29 +1026,40 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     }
 }
 
+impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Picker<I, D> {
+    fn layout(&self, area: Rect) -> (Rect, Option<Rect>) {
+        // +---------+ +---------+    +---------+
+        // |prompt   | |preview  |    |preview  |
+        // +---------+ |         |    |         |
+        // |picker   | |         |    |         |
+        // |         | |         |    +---------+
+        // +---------+ +---------+    |prompt   |
+        //                            +---------+
+        //                            |picker   |
+        //                            +---------+
+        if !self.show_preview || self.file_fn.is_none() {
+            return (area, None);
+        }
+        let fits_beside = area.width > MIN_AREA_WIDTH_FOR_PREVIEW;
+        let fits_stacked = area.height >= MIN_AREA_HEIGHT_FOR_STACKED_PREVIEW;
+        let portrait = area.width < CELL_ASPECT * area.height;
+        if fits_stacked && (portrait || !fits_beside) {
+            let preview = area.with_height(area.height - area.height / 3);
+            (area.clip_top(preview.height), Some(preview))
+        } else if fits_beside {
+            let picker = area.with_width(area.width / 2);
+            (picker, Some(area.clip_left(picker.width)))
+        } else {
+            (area, None)
+        }
+    }
+}
+
 impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I, D> {
     fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
-        // +---------+ +---------+
-        // |prompt   | |preview  |
-        // +---------+ |         |
-        // |picker   | |         |
-        // |         | |         |
-        // +---------+ +---------+
-
-        let render_preview =
-            self.show_preview && self.file_fn.is_some() && area.width > MIN_AREA_WIDTH_FOR_PREVIEW;
-
-        let picker_width = if render_preview {
-            area.width / 2
-        } else {
-            area.width
-        };
-
-        let picker_area = area.with_width(picker_width);
+        let (picker_area, preview_area) = self.layout(area);
         self.render_picker(picker_area, surface, cx);
-
-        if render_preview {
-            let preview_area = area.clip_left(picker_width);
+        if let Some(preview_area) = preview_area {
             self.render_preview(preview_area, surface, cx);
         }
     }
@@ -1023,29 +1071,32 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             Event::Key(event) => *event,
             Event::Paste(..) => return self.prompt_handle_event(event, ctx),
             Event::Resize(..) => return EventResult::Consumed(None),
+            // Picker is a modal and should consume mouse events so clicks don't fall
+            // through to the editor underneath
+            Event::Mouse(_) => return EventResult::Consumed(None),
             _ => return EventResult::Ignored(None),
         };
 
         let close_fn = |picker: &mut Self| {
             // if the picker is very large don't store it as last_picker to avoid
             // excessive memory consumption
-            let callback: compositor::Callback = if picker.matcher.snapshot().item_count() > 100_000
-            {
-                Box::new(|compositor: &mut Compositor, _ctx| {
-                    // remove the layer
-                    compositor.pop();
-                })
-            } else {
-                // stop streaming in new items in the background, really we should
-                // be restarting the stream somehow once the picker gets
-                // reopened instead (like for an FS crawl) that would also remove the
-                // need for the special case above but that is pretty tricky
-                picker.version.fetch_add(1, atomic::Ordering::Relaxed);
-                Box::new(|compositor: &mut Compositor, _ctx| {
-                    // remove the layer
-                    compositor.last_picker = compositor.pop();
-                })
-            };
+            let callback: compositor::Callback =
+                if picker.matcher.snapshot().item_count() > 1_000_000 {
+                    Box::new(|compositor: &mut Compositor, _ctx| {
+                        // remove the layer
+                        compositor.pop();
+                    })
+                } else {
+                    // stop streaming in new items in the background, really we should
+                    // be restarting the stream somehow once the picker gets
+                    // reopened instead (like for an FS crawl) that would also remove the
+                    // need for the special case above but that is pretty tricky
+                    picker.version.fetch_add(1, atomic::Ordering::Relaxed);
+                    Box::new(|compositor: &mut Compositor, _ctx| {
+                        // remove the layer
+                        compositor.last_picker = compositor.pop();
+                    })
+                };
             EventResult::Consumed(Some(callback))
         };
 
@@ -1071,7 +1122,7 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             key!(Esc) | ctrl!('c') => return close_fn(self),
             alt!(Enter) => {
                 if let Some(option) = self.selection() {
-                    (self.callback_fn)(ctx, option, Action::Replace);
+                    (self.callback_fn)(ctx, option, self.default_action);
                 }
             }
             key!(Enter) => {
@@ -1095,7 +1146,7 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
                     self.handle_prompt_change(true);
                 } else {
                     if let Some(option) = self.selection() {
-                        (self.callback_fn)(ctx, option, Action::Replace);
+                        (self.callback_fn)(ctx, option, self.default_action);
                     }
                     if let Some(history_register) = self.prompt.history_register() {
                         if let Err(err) = ctx
@@ -1133,26 +1184,18 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
     }
 
     fn cursor(&self, area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
-        let block = Block::bordered();
-        // calculate the inner area inside the box
-        let inner = block.inner(area);
-
-        // prompt area
-        let render_preview =
-            self.show_preview && self.file_fn.is_some() && area.width > MIN_AREA_WIDTH_FOR_PREVIEW;
-
-        let picker_width = if render_preview {
-            area.width / 2
-        } else {
-            area.width
-        };
-        let area = inner.clip_left(1).with_height(1).with_width(picker_width);
+        let (picker_area, _) = self.layout(area);
+        let area = Block::bordered()
+            .inner(picker_area)
+            .clip_left(1)
+            .with_height(1);
 
         self.prompt.cursor(area, editor)
     }
 
     fn required_size(&mut self, (width, height): (u16, u16)) -> Option<(u16, u16)> {
-        self.completion_height = height.saturating_sub(4 + self.header_height());
+        let (picker_area, _) = self.layout(Rect::new(0, 0, width, height));
+        self.completion_height = picker_area.height.saturating_sub(4 + self.header_height());
         Some((width, height))
     }
 
